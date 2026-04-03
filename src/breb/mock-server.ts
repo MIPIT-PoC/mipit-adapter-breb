@@ -5,13 +5,24 @@
  * Implements the Bre-B SPI response format per BanRep specification:
  *   POST /breb/v1/pagos → BreBPaymentResponse
  *
- * Simulated behaviors:
- *   - 5%  RECHAZADA: BREB001 (fondos insuficientes)
- *   - 3%  RECHAZADA: BREB004 (receptor no registrado)
- *   - 2%  RECHAZADA: BREB003 (límite excedido) when amount > 20,000,000 COP
- *   - idTransaccion format validation (32 chars, starts with 'BR')
- *   - Realistic latency simulation (80–400ms)
- *   - COP amount limits: max 20,000,000 COP per transaction
+ * Simulated behaviors per BanRep SPI spec v1.0 (2023):
+ *   - idTransaccion deduplication (idempotency)
+ *   - Full BanRep error code set:
+ *       BREB001 — Fondos insuficientes
+ *       BREB002 — Datos del beneficiario incorrectos
+ *       BREB003 — Límite por transacción excedido (> 20M COP natural, > 200M COP jurídica)
+ *       BREB004 — Receptor no registrado en Bre-B
+ *       BREB005 — Servicio temporalmente no disponible
+ *   - Llave format validation by tipoLlave:
+ *       TELEFONO: +57 + 10 digits (Colombian mobile)
+ *       NIT:      9–10 digits + '-' + 1 check digit (e.g. "900123456-1")
+ *       EMAIL:    RFC 5321
+ *       ALIAS:    4–20 alphanumeric chars, no spaces
+ *   - pagador.codigoEntidad: 8 digits
+ *   - concepto max 140 chars
+ *   - Amount: 2-decimal string, > 0
+ *   - COP limits: max 20,000,000 for natural persons; 200,000,000 for legal entities
+ *   - Realistic latency (80–400ms)
  */
 
 import express from 'express';
@@ -23,7 +34,20 @@ import type { BreBPaymentRequest, BreBPaymentResponse } from './types.js';
 const app = express();
 app.use(express.json());
 
-const MAX_AMOUNT_COP = 20_000_000; // BanRep per-transaction limit for natural persons
+/** In-memory idempotency store: idTransaccion → response */
+const processedPayments = new Map<string, BreBPaymentResponse>();
+
+/** Bre-B per-transaction limits (COP) */
+const LIMIT_NATURAL_COP    = 20_000_000;   // natural persons
+const LIMIT_JURIDICA_COP   = 200_000_000;  // legal entities (NIT payer)
+
+/** Llave format validators by tipoLlave */
+const LLAVE_VALIDATORS: Record<string, RegExp> = {
+  TELEFONO: /^\+57\d{10}$/,                           // +57 + 10 digits
+  NIT:      /^\d{9,10}-\d$/,                          // 9–10 digits + dash + check digit
+  EMAIL:    /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/,
+  ALIAS:    /^[A-Za-z0-9]{4,20}$/,                    // 4–20 alphanumeric, no spaces or symbols
+};
 
 /**
  * POST /breb/v1/pagos
@@ -31,23 +55,30 @@ const MAX_AMOUNT_COP = 20_000_000; // BanRep per-transaction limit for natural p
  */
 app.post('/breb/v1/pagos', (req, res) => {
   const body = req.body as Partial<BreBPaymentRequest>;
-  const { idTransaccion, valor, pagador, beneficiario, llave } = body;
+  const { idTransaccion, valor, pagador, beneficiario, llave, tipoLlave, concepto } = body;
 
-  // === Validation: idTransaccion ===
+  // === Idempotency: return cached response for duplicate idTransaccion ===
+  if (idTransaccion && processedPayments.has(idTransaccion)) {
+    logger.info({ idTransaccion }, 'Bre-B mock: duplicate idTransaccion — returning cached response');
+    return res.status(200).json(processedPayments.get(idTransaccion));
+  }
+
+  // === Validation: idTransaccion format ===
+  // Format: BR + codigoEntidad(8) + YYYYMMDD(8) + HHmm(4) + unique(10) = 32 chars
   if (!idTransaccion || !/^BR\d{8}\d{8}\d{4}[A-Z0-9]{10}$/.test(idTransaccion)) {
     logger.warn({ idTransaccion }, 'Bre-B mock: invalid idTransaccion format');
     return res.status(400).json({
       titulo: 'Parámetro inválido.',
-      detalle: `El campo idTransaccion '${idTransaccion ?? ''}' no cumple el formato BR{codigoEntidad(8)}{YYYYMMDD}{HHmm}{unique(10)}.`,
+      detalle: `idTransaccion '${idTransaccion ?? ''}' no cumple el formato BR{codigoEntidad(8)}{YYYYMMDD}{HHmm}{unique(10)} = 32 chars.`,
       violaciones: [{ razon: 'Campo fuera del patrón esperado.', campo: 'idTransaccion' }],
     });
   }
 
-  // === Validation: Amount ===
+  // === Validation: Amount format ===
   if (!valor?.original || !/^\d+\.\d{2}$/.test(valor.original)) {
     return res.status(400).json({
       titulo: 'Parámetro inválido.',
-      detalle: 'El campo valor.original debe ser string con exactamente 2 decimales.',
+      detalle: 'valor.original debe ser string con exactamente 2 decimales (ej: "500000.00" COP).',
       violaciones: [{ razon: 'Formato inválido.', campo: 'valor.original' }],
     });
   }
@@ -55,24 +86,39 @@ app.post('/breb/v1/pagos', (req, res) => {
   const amountCOP = parseFloat(valor.original);
 
   if (amountCOP <= 0) {
-    return res.status(200).json(buildRejectedResponse(idTransaccion, 'BREB_AM01', 'Valor cero no permitido.'));
+    const r = buildRejectedResponse(idTransaccion, 'BREB_AM01', 'Valor cero no está permitido en el sistema Bre-B.');
+    processedPayments.set(idTransaccion, r);
+    return res.status(200).json(r);
   }
 
-  // === Validation: COP limit ===
-  if (amountCOP > MAX_AMOUNT_COP) {
-    return res.status(200).json(buildRejectedResponse(idTransaccion, 'BREB003', `Monto excede el límite por transacción de ${MAX_AMOUNT_COP.toLocaleString('es-CO')} COP.`));
-  }
-
-  // === Validation: Pagador ===
+  // === Validation: pagador entity code ===
   if (!pagador?.codigoEntidad || !/^\d{8}$/.test(pagador.codigoEntidad)) {
     return res.status(400).json({
       titulo: 'Entidad pagadora inválida.',
-      detalle: 'pagador.codigoEntidad debe ser 8 dígitos.',
+      detalle: 'pagador.codigoEntidad debe ser exactamente 8 dígitos del catálogo BanRep.',
       violaciones: [{ razon: 'Formato inválido.', campo: 'pagador.codigoEntidad' }],
     });
   }
 
-  // === Validation: Llave ===
+  // === Validation: pagador nombre required ===
+  if (!pagador?.nombre || pagador.nombre.trim() === '') {
+    return res.status(400).json({
+      titulo: 'Nombre del pagador requerido.',
+      detalle: 'pagador.nombre es obligatorio.',
+      violaciones: [{ razon: 'Campo requerido.', campo: 'pagador.nombre' }],
+    });
+  }
+
+  // === Validation: beneficiario entity code ===
+  if (beneficiario?.codigoEntidad && !/^\d{8}$/.test(beneficiario.codigoEntidad)) {
+    return res.status(400).json({
+      titulo: 'Entidad beneficiaria inválida.',
+      detalle: 'beneficiario.codigoEntidad debe ser exactamente 8 dígitos del catálogo BanRep.',
+      violaciones: [{ razon: 'Formato inválido.', campo: 'beneficiario.codigoEntidad' }],
+    });
+  }
+
+  // === Validation: llave required ===
   if (!llave || llave.trim() === '') {
     return res.status(400).json({
       titulo: 'Llave requerida.',
@@ -81,29 +127,82 @@ app.post('/breb/v1/pagos', (req, res) => {
     });
   }
 
-  // Simulate realistic latency
+  // === Validation: llave format by tipoLlave ===
+  if (tipoLlave && LLAVE_VALIDATORS[tipoLlave]) {
+    if (!LLAVE_VALIDATORS[tipoLlave].test(llave)) {
+      const r = buildRejectedResponse(idTransaccion, 'BREB002',
+        `La llave '${llave}' no cumple el formato esperado para tipoLlave '${tipoLlave}'. ` +
+        `Formatos aceptados — TELEFONO: +57XXXXXXXXXX | NIT: XXXXXXXXX-D | EMAIL: user@domain.co | ALIAS: 4–20 alfanuméricos.`);
+      processedPayments.set(idTransaccion, r);
+      return res.status(200).json(r);
+    }
+  }
+
+  // === Validation: concepto max 140 chars ===
+  if (concepto && concepto.length > 140) {
+    return res.status(400).json({
+      titulo: 'Concepto demasiado largo.',
+      detalle: 'concepto no puede exceder 140 caracteres.',
+      violaciones: [{ razon: 'Longitud excedida.', campo: 'concepto' }],
+    });
+  }
+
+  // === Validation: COP transaction limit ===
+  // Legal entities (NIT) have a higher limit
+  const isLegalEntity = Boolean(pagador?.nit);
+  const applicableLimit = isLegalEntity ? LIMIT_JURIDICA_COP : LIMIT_NATURAL_COP;
+
+  if (amountCOP > applicableLimit) {
+    const r = buildRejectedResponse(idTransaccion, 'BREB003',
+      `Monto COP ${amountCOP.toLocaleString('es-CO')} excede el límite por transacción de ` +
+      `${applicableLimit.toLocaleString('es-CO')} COP para ${isLegalEntity ? 'personas jurídicas' : 'personas naturales'}.`);
+    processedPayments.set(idTransaccion, r);
+    return res.status(200).json(r);
+  }
+
+  // === Simulate realistic latency (80–400ms) ===
   const latency = 80 + Math.floor(Math.random() * 320);
 
   setTimeout(() => {
     const rand = Math.random();
 
-    // 5% fondos insuficientes
-    if (rand < 0.05) {
-      logger.info({ idTransaccion }, 'Bre-B mock: simulating BREB001 (fondos insuficientes)');
-      return res.status(200).json(
-        buildRejectedResponse(idTransaccion, 'BREB001', 'Fondos insuficientes en la cuenta del pagador.')
-      );
+    // 4% — Fondos insuficientes (BREB001)
+    if (rand < 0.04) {
+      logger.info({ idTransaccion, amountCOP }, 'Bre-B mock: BREB001 (fondos insuficientes)');
+      const r = buildRejectedResponse(idTransaccion, 'BREB001',
+        'Fondos insuficientes en la cuenta del pagador para cubrir el monto solicitado.');
+      processedPayments.set(idTransaccion, r);
+      return res.status(200).json(r);
     }
 
-    // 3% receptor no registrado
-    if (rand < 0.08) {
-      logger.info({ idTransaccion, llave }, 'Bre-B mock: simulating BREB004 (receptor no registrado)');
-      return res.status(200).json(
-        buildRejectedResponse(idTransaccion, 'BREB004', `La llave '${llave}' no está registrada en el sistema Bre-B.`)
-      );
+    // 3% — Receptor no registrado (BREB004)
+    if (rand < 0.07) {
+      logger.info({ idTransaccion, llave }, 'Bre-B mock: BREB004 (receptor no registrado)');
+      const r = buildRejectedResponse(idTransaccion, 'BREB004',
+        `La llave '${llave}' no está registrada en el Directorio Bre-B de BanRep.`);
+      processedPayments.set(idTransaccion, r);
+      return res.status(200).json(r);
     }
 
-    // 92% success (ACEPTADA)
+    // 2% — Datos incorrectos (BREB002)
+    if (rand < 0.09) {
+      logger.info({ idTransaccion }, 'Bre-B mock: BREB002 (datos del beneficiario incorrectos)');
+      const r = buildRejectedResponse(idTransaccion, 'BREB002',
+        'Los datos del beneficiario (nombre/entidad) no coinciden con los registrados en el Directorio Bre-B.');
+      processedPayments.set(idTransaccion, r);
+      return res.status(200).json(r);
+    }
+
+    // 1% — Servicio no disponible (BREB005)
+    if (rand < 0.10) {
+      logger.info({ idTransaccion }, 'Bre-B mock: BREB005 (servicio temporalmente no disponible)');
+      const r = buildRejectedResponse(idTransaccion, 'BREB005',
+        'El servicio Bre-B está temporalmente no disponible. Reintente en unos minutos.');
+      processedPayments.set(idTransaccion, r);
+      return res.status(200).json(r);
+    }
+
+    // 90% — Éxito (ACEPTADA)
     const idConfirmacion = `BRE${Date.now()}${ulid().substring(0, 6)}`;
     logger.info({ idTransaccion, idConfirmacion, amountCOP }, 'Bre-B mock: payment ACEPTADA');
 
@@ -114,16 +213,44 @@ app.post('/breb/v1/pagos', (req, res) => {
       fechaLiquidacion: new Date().toISOString(),
     };
 
+    processedPayments.set(idTransaccion, response);
     return res.status(200).json(response);
   }, latency);
 });
 
-/** GET /health — health check */
-app.get('/health', (_req, res) => {
-  res.json({ status: 'ok', service: 'mipit-breb-mock', timestamp: new Date().toISOString() });
+/** GET /breb/v1/pagos/:idTransaccion — query payment status */
+app.get('/breb/v1/pagos/:idTransaccion', (req, res) => {
+  const { idTransaccion } = req.params;
+  const payment = processedPayments.get(idTransaccion);
+  if (!payment) {
+    return res.status(404).json({
+      titulo: 'Pago no encontrado.',
+      detalle: `idTransaccion '${idTransaccion}' no localizado en el sistema Bre-B.`,
+    });
+  }
+  res.status(200).json(payment);
 });
 
-function buildRejectedResponse(idTransaccion: string, codigoError: string, descripcion: string): BreBPaymentResponse {
+/** GET /health — health check */
+app.get('/health', (_req, res) => {
+  res.json({
+    status: 'ok',
+    service: 'mipit-breb-mock',
+    version: '1.0',
+    processedCount: processedPayments.size,
+    limits: {
+      naturalPersonCOP: LIMIT_NATURAL_COP,
+      legalEntityCOP: LIMIT_JURIDICA_COP,
+    },
+    timestamp: new Date().toISOString(),
+  });
+});
+
+function buildRejectedResponse(
+  idTransaccion: string,
+  codigoError: string,
+  descripcion: string,
+): BreBPaymentResponse {
   return {
     idTransaccion,
     idConfirmacion: `ERR${Date.now()}`,
@@ -136,7 +263,7 @@ function buildRejectedResponse(idTransaccion: string, codigoError: string, descr
 export function startMockServer(): Promise<void> {
   return new Promise((resolve) => {
     app.listen(env.BREB_MOCK_PORT, () => {
-      logger.info({ port: env.BREB_MOCK_PORT }, 'Bre-B BanRep mock server started');
+      logger.info({ port: env.BREB_MOCK_PORT }, 'Bre-B BanRep SPI mock server started (v1.0)');
       resolve();
     });
   });
