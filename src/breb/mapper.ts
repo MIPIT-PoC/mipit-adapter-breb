@@ -52,9 +52,10 @@ export function canonicalToBreBPayload(canonical: CanonicalPacs008): BreBPayment
     : rawCreditorAccount;
 
   // Llave: use alias value if LLAVE_BREB, otherwise use creditor account
-  const llave = canonical.alias.type === 'LLAVE_BREB'
+  const rawLlave = canonical.alias.type === 'LLAVE_BREB'
     ? canonical.alias.value
     : creditorAccount;
+  const llave = rawLlave.replace(/^BREB-/, '');
 
   // Derive key type from alias format
   let tipoLlave: 'TELEFONO' | 'NIT' | 'EMAIL' | 'ALIAS' = 'ALIAS';
