@@ -77,7 +77,7 @@ export async function startWorker(channel: Channel) {
         processed_at: new Date().toISOString(),
       };
 
-      publishAck(channel, ackMessage as unknown as Record<string, unknown>);
+      publishAck(channel, ackMessage );
 
       brebPaymentsTotal.inc({ status: railAck.status === 'ACCEPTED' ? 'success' : 'rejected' });
       brebPaymentLatency.observe({ status: railAck.status === 'ACCEPTED' ? 'success' : 'rejected' }, latencyMs);
@@ -107,7 +107,7 @@ export async function startWorker(channel: Channel) {
         processed_at: new Date().toISOString(),
       };
 
-      publishAck(channel, failAck as unknown as Record<string, unknown>);
+      publishAck(channel, failAck );
 
       brebPaymentsTotal.inc({ status: 'error' });
       brebPaymentLatency.observe({ status: 'error' }, latencyMs);

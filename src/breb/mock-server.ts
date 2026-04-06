@@ -30,12 +30,26 @@ import { ulid } from 'ulid';
 import { env } from '../config/env.js';
 import { logger } from '../observability/logger.js';
 import type { BreBPaymentRequest, BreBPaymentResponse } from './types.js';
+import { registerOAuth2Routes, oauthMiddleware } from './oauth-mock.js';
+import { registerAdminRoutes, mockConfig, mockStats } from './admin-routes.js';
 
 const app = express();
+app.use((_req, res, next) => {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, PATCH, DELETE, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+  if (_req.method === 'OPTIONS') return res.sendStatus(204);
+  next();
+});
 app.use(express.json());
+
+registerOAuth2Routes(app);
+app.use(oauthMiddleware);
 
 /** In-memory idempotency store: idTransaccion → response */
 const processedPayments = new Map<string, BreBPaymentResponse>();
+
+registerAdminRoutes(app, processedPayments);
 
 /** Bre-B per-transaction limits (COP) */
 const LIMIT_NATURAL_COP    = 20_000_000;   // natural persons
@@ -160,51 +174,85 @@ app.post('/breb/v1/pagos', (req, res) => {
     return res.status(200).json(r);
   }
 
-  // === Simulate realistic latency (80–400ms) ===
-  const latency = 80 + Math.floor(Math.random() * 320);
+  mockStats.totalReceived++;
+  mockStats.lastPaymentAt = new Date().toISOString();
+
+  if (!mockConfig.enabled) {
+    return res.status(503).json({
+      titulo: 'Servicio no disponible.',
+      detalle: 'El servicio Bre-B está temporalmente no disponible para mantenimiento.',
+    });
+  }
+
+  if (mockConfig.forceRejectNext) {
+    mockConfig.forceRejectNext = false;
+    mockStats.totalRejected++;
+    const r = buildRejectedResponse(idTransaccion, mockConfig.forceRejectCode,
+      `[ADMIN] Rechazo forzado por el simulador (código: ${mockConfig.forceRejectCode}).`);
+    processedPayments.set(idTransaccion, r);
+    return res.status(200).json(r);
+  }
+
+  if (mockConfig.forceTimeoutNext) {
+    mockConfig.forceTimeoutNext = false;
+    mockStats.totalTimeout++;
+    logger.info({ idTransaccion }, 'Bre-B mock: forcing 30s timeout (admin)');
+    setTimeout(() => {
+      res.status(504).json({
+        titulo: 'Gateway Timeout',
+        detalle: 'Bre-B no respondió dentro del plazo.',
+      });
+    }, 30_000);
+    return;
+  }
+
+  const latencySpan = Math.max(0, mockConfig.maxLatencyMs - mockConfig.minLatencyMs);
+  const latency = mockConfig.minLatencyMs + Math.floor(Math.random() * (latencySpan + 1));
 
   setTimeout(() => {
     const rand = Math.random();
+    const rr = mockConfig.rejectionRate;
 
-    // 4% — Fondos insuficientes (BREB001)
-    if (rand < 0.04) {
+    // Within rejection bucket: 40% BREB001, 30% BREB004, 20% BREB002, 10% BREB005 (same relative mix as baseline ~10% total)
+    if (rand < rr * 0.4) {
       logger.info({ idTransaccion, amountCOP }, 'Bre-B mock: BREB001 (fondos insuficientes)');
+      mockStats.totalRejected++;
       const r = buildRejectedResponse(idTransaccion, 'BREB001',
         'Fondos insuficientes en la cuenta del pagador para cubrir el monto solicitado.');
       processedPayments.set(idTransaccion, r);
       return res.status(200).json(r);
     }
 
-    // 3% — Receptor no registrado (BREB004)
-    if (rand < 0.07) {
+    if (rand < rr * 0.7) {
       logger.info({ idTransaccion, llave }, 'Bre-B mock: BREB004 (receptor no registrado)');
+      mockStats.totalRejected++;
       const r = buildRejectedResponse(idTransaccion, 'BREB004',
         `La llave '${llave}' no está registrada en el Directorio Bre-B de BanRep.`);
       processedPayments.set(idTransaccion, r);
       return res.status(200).json(r);
     }
 
-    // 2% — Datos incorrectos (BREB002)
-    if (rand < 0.09) {
+    if (rand < rr * 0.9) {
       logger.info({ idTransaccion }, 'Bre-B mock: BREB002 (datos del beneficiario incorrectos)');
+      mockStats.totalRejected++;
       const r = buildRejectedResponse(idTransaccion, 'BREB002',
         'Los datos del beneficiario (nombre/entidad) no coinciden con los registrados en el Directorio Bre-B.');
       processedPayments.set(idTransaccion, r);
       return res.status(200).json(r);
     }
 
-    // 1% — Servicio no disponible (BREB005)
-    if (rand < 0.10) {
+    if (rand < rr) {
       logger.info({ idTransaccion }, 'Bre-B mock: BREB005 (servicio temporalmente no disponible)');
+      mockStats.totalRejected++;
       const r = buildRejectedResponse(idTransaccion, 'BREB005',
         'El servicio Bre-B está temporalmente no disponible. Reintente en unos minutos.');
       processedPayments.set(idTransaccion, r);
       return res.status(200).json(r);
     }
 
-    // 90% — Éxito (ACEPTADA)
     const idConfirmacion = `BRE${Date.now()}${ulid().substring(0, 6)}`;
     logger.info({ idTransaccion, idConfirmacion, amountCOP }, 'Bre-B mock: payment ACEPTADA');
+    mockStats.totalAccepted++;
 
     const response: BreBPaymentResponse = {
       idTransaccion,
