@@ -6,7 +6,7 @@ import { brebResponseToAck } from './breb/response-mapper.js';
 import { sendBrebPayment } from './breb/client.js';
 import { publishAck } from './messaging/publisher.js';
 import { logger } from './observability/logger.js';
-import { brebPaymentsTotal, brebPaymentLatency } from './observability/metrics.js';
+import { brebPaymentsTotal, brebPaymentLatency, recordAdapterRequest } from './observability/metrics.js';
 
 export interface PaymentRouteMessage {
   payment_id: string;
@@ -79,8 +79,11 @@ export async function startWorker(channel: Channel) {
 
       publishAck(channel, ackMessage );
 
-      brebPaymentsTotal.inc({ status: railAck.status === 'ACCEPTED' ? 'success' : 'rejected' });
-      brebPaymentLatency.observe({ status: railAck.status === 'ACCEPTED' ? 'success' : 'rejected' }, latencyMs);
+      // P07: unified `mipit_adapter_*` metrics + legacy
+      const outcome = railAck.status === 'ACCEPTED' ? 'success' : 'rejected';
+      brebPaymentsTotal.inc({ status: outcome });
+      brebPaymentLatency.observe({ status: outcome }, latencyMs);
+      recordAdapterRequest(outcome, latencyMs, railAck.error?.code);
 
       logger.info(
         { payment_id: routeMsg.payment_id, status: railAck.status, latency_ms: latencyMs },
@@ -111,6 +114,7 @@ export async function startWorker(channel: Channel) {
 
       brebPaymentsTotal.inc({ status: 'error' });
       brebPaymentLatency.observe({ status: 'error' }, latencyMs);
+      recordAdapterRequest('error', latencyMs, 'WORKER_ERROR');
 
       channel.nack(msg, false, false);
     }
