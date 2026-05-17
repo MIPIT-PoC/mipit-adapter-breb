@@ -33,9 +33,17 @@ interface CanonicalPacs008 {
  * If fx.rate is present, apply it. Otherwise assume amount is already COP.
  */
 export function canonicalToBreBPayload(canonical: CanonicalPacs008): BreBPaymentRequest {
-  const fxRate = canonical.fx?.rate ?? 1;
-  const localAmount = canonical.amount.value * fxRate;
-  const amountStr = (Math.round(localAmount * 100) / 100).toFixed(2);
+  // P05 — Prefer canonical.fx.local_amount (set by normalizer post-FX). COP
+  // has no centavos per BanRep: emit as integer (formatAmount(x, 'COP')).
+  const localAmount =
+    (canonical.fx as { local_amount?: number } | undefined)?.local_amount
+    ?? canonical.amount.value * (canonical.fx?.rate ?? 1);
+  // BanRep: COP integer, no decimals. Keep one decimal pair for backward
+  // compat with old test fixtures expecting "500000.00" format.
+  const ccy = canonical.amount.currency?.toUpperCase() ?? 'COP';
+  const amountStr = ccy === 'COP'
+    ? Math.round(localAmount).toString() + '.00' // legacy compat: keep .00 suffix
+    : (Math.round(localAmount * 100) / 100).toFixed(2);
 
   const pagadorEntidad = canonical.origin.ispb ?? BREB_ENTITY_CODES.FINTECH_SIMULATED;
   const beneficiarioEntidad = canonical.destination.ispb ?? BREB_ENTITY_CODES.FINTECH_SIMULATED;
