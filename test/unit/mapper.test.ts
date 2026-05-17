@@ -146,8 +146,13 @@ describe('canonicalToBreBPayload', () => {
 });
 
 describe('generateBrebTransactionId', () => {
-  it('generates exactly 32 chars', () => {
-    const id = generateBrebTransactionId();
+  it('generates exactly 28 chars with 4-digit entity (P04 preferred)', () => {
+    const id = generateBrebTransactionId('9999');
+    expect(id).toHaveLength(28);
+  });
+
+  it('generates exactly 32 chars with legacy 8-digit entity (backward compat)', () => {
+    const id = generateBrebTransactionId('00009999');
     expect(id).toHaveLength(32);
   });
 
@@ -156,14 +161,16 @@ describe('generateBrebTransactionId', () => {
     expect(id.startsWith('BR')).toBe(true);
   });
 
-  it('contains codigoEntidad at positions 2-9', () => {
+  it('contains codigoEntidad at positions 2-9 with legacy 8-digit', () => {
     const id = generateBrebTransactionId('26264220');
     expect(id.substring(2, 10)).toBe('26264220');
   });
 
-  it('matches the BR{8}{8}{4}{10} pattern', () => {
-    const id = generateBrebTransactionId();
-    expect(id).toMatch(/^BR\d{8}\d{8}\d{4}[A-Z0-9]{10}$/);
+  it('matches BR{4-or-8}{8 date}{4 time}{10 alnum} pattern', () => {
+    const id4 = generateBrebTransactionId('9999');
+    expect(id4).toMatch(/^BR\d{4}\d{8}\d{4}[A-Z0-9]{10}$/);
+    const id8 = generateBrebTransactionId('00009999');
+    expect(id8).toMatch(/^BR\d{8}\d{8}\d{4}[A-Z0-9]{10}$/);
   });
 
   it('generates unique IDs on each call', () => {

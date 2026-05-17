@@ -1,28 +1,27 @@
 /**
  * Bre-B BanRep SPI Mock Server
  *
- * Simulates the Banco de la República (Colombia) SPI sandbox endpoint for PoC testing.
- * Implements the Bre-B SPI response format per BanRep specification:
- *   POST /breb/v1/pagos → BreBPaymentResponse
+ * CRITICAL NOTE (P04 — PoC limitation):
+ * As of audit date (2026-05-16), Banco de la República has NOT published a
+ * public wire-format specification for Bre-B SPI participant integration.
+ * The endpoint URL (`POST /breb/v1/pagos`), field names, error codes
+ * (BREB001-BREB005), and OAuth flow are EDUCATED GUESSES, not BanRep-verified.
  *
- * Simulated behaviors per BanRep SPI spec v1.0 (2023):
- *   - idTransaccion deduplication (idempotency)
- *   - Full BanRep error code set:
- *       BREB001 — Fondos insuficientes
- *       BREB002 — Datos del beneficiario incorrectos
- *       BREB003 — Límite por transacción excedido (> 20M COP natural, > 200M COP jurídica)
- *       BREB004 — Receptor no registrado en Bre-B
- *       BREB005 — Servicio temporalmente no disponible
- *   - Llave format validation by tipoLlave:
- *       TELEFONO: +57 + 10 digits (Colombian mobile)
- *       NIT:      9–10 digits + '-' + 1 check digit (e.g. "900123456-1")
- *       EMAIL:    RFC 5321
- *       ALIAS:    4–20 alphanumeric chars, no spaces
- *   - pagador.codigoEntidad: 8 digits
- *   - concepto max 140 chars
- *   - Amount: 2-decimal string, > 0
- *   - COP limits: max 20,000,000 for natural persons; 200,000,000 for legal entities
- *   - Realistic latency (80–400ms)
+ * Llave types ARE based on public BanRep announcements (see types.ts).
+ *
+ * Implementation details (post P04):
+ *   - Full BanRep llave taxonomy: CC, CE, NIT, PASAPORTE, TELEFONO (mobile
+ *     only: +57 3xx), EMAIL, ALIAS (@-prefix per BanRep).
+ *   - NIT mod-11 DIAN check-digit validation (not just regex form).
+ *   - idTransaccion in Bogotá time (UTC-5), not UTC (was wrong before).
+ *   - codigoEntidad accepts 4-digit Superfinanciera (preferred) or legacy
+ *     8-digit during rollout.
+ *   - Operating hours: 24/7/365 per BanRep launch announcements.
+ *   - Idempotency by idTransaccion.
+ *   - Invented error codes BREB001-005 (NOT a real BanRep catalog).
+ *
+ * For thesis-defense honesty: this adapter is a "reference implementation
+ * pending official spec publication", not byte-fidelity to a real Bre-B API.
  */
 
 import express from 'express';
@@ -30,6 +29,7 @@ import { ulid } from 'ulid';
 import { env } from '../config/env.js';
 import { logger } from '../observability/logger.js';
 import type { BreBPaymentRequest, BreBPaymentResponse } from './types.js';
+import { isValidNIT } from './types.js';
 import { registerOAuth2Routes, oauthMiddleware } from './oauth-mock.js';
 import { registerAdminRoutes, mockConfig, mockStats } from './admin-routes.js';
 
@@ -55,12 +55,20 @@ registerAdminRoutes(app, processedPayments);
 const LIMIT_NATURAL_COP    = 20_000_000;   // natural persons
 const LIMIT_JURIDICA_COP   = 200_000_000;  // legal entities (NIT payer)
 
-/** Llave format validators by tipoLlave */
+/**
+ * P04 — Full BanRep llave taxonomy:
+ *   CC, CE, NIT, PASAPORTE, TELEFONO (mobile only), EMAIL, ALIAS (@-prefix).
+ * Previous validator set rejected CC/CE/Pasaporte; ALIAS rejected the `@`
+ * prefix that BanRep requires.
+ */
 const LLAVE_VALIDATORS: Record<string, RegExp> = {
-  TELEFONO: /^\+57\d{10}$/,                           // +57 + 10 digits
-  NIT:      /^\d{9,10}-\d$/,                          // 9–10 digits + dash + check digit
-  EMAIL:    /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/,
-  ALIAS:    /^[A-Za-z0-9]{4,20}$/,                    // 4–20 alphanumeric, no spaces or symbols
+  CC:        /^\d{6,10}$/,                              // 6–10 digits
+  CE:        /^\d{6,7}$/,                               // Cédula extranjería 6–7 digits
+  NIT:       /^\d{9,10}-\d$/,                           // 9–10 + dash + check
+  PASAPORTE: /^[A-Z0-9]{6,12}$/i,                       // alphanumeric
+  TELEFONO:  /^\+573\d{9}$/,                            // mobile only: +57 3xx XXX XXXX
+  EMAIL:     /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/,
+  ALIAS:     /^@[A-Za-z0-9._]{3,19}$/,                  // BanRep: @-prefix + 3–19 chars
 };
 
 /**
@@ -79,7 +87,9 @@ app.post('/breb/v1/pagos', (req, res) => {
 
   // === Validation: idTransaccion format ===
   // Format: BR + codigoEntidad(8) + YYYYMMDD(8) + HHmm(4) + unique(10) = 32 chars
-  if (!idTransaccion || !/^BR\d{8}\d{8}\d{4}[A-Z0-9]{10}$/.test(idTransaccion)) {
+  // P04 — accept 4-digit (preferred, 28 chars total) and legacy 8-digit
+  // entity code (32 chars total) during rollout.
+  if (!idTransaccion || !/^BR(\d{4}|\d{8})\d{8}\d{4}[A-Za-z0-9]{10}$/.test(idTransaccion)) {
     logger.warn({ idTransaccion }, 'Bre-B mock: invalid idTransaccion format');
     return res.status(400).json({
       titulo: 'Parámetro inválido.',
@@ -106,7 +116,7 @@ app.post('/breb/v1/pagos', (req, res) => {
   }
 
   // === Validation: pagador entity code ===
-  if (!pagador?.codigoEntidad || !/^\d{8}$/.test(pagador.codigoEntidad)) {
+  if (!pagador?.codigoEntidad || !/^(\d{4}|\d{8})$/.test(pagador.codigoEntidad)) {
     return res.status(400).json({
       titulo: 'Entidad pagadora inválida.',
       detalle: 'pagador.codigoEntidad debe ser exactamente 8 dígitos del catálogo BanRep.',
@@ -124,7 +134,7 @@ app.post('/breb/v1/pagos', (req, res) => {
   }
 
   // === Validation: beneficiario entity code ===
-  if (beneficiario?.codigoEntidad && !/^\d{8}$/.test(beneficiario.codigoEntidad)) {
+  if (beneficiario?.codigoEntidad && !/^(\d{4}|\d{8})$/.test(beneficiario.codigoEntidad)) {
     return res.status(400).json({
       titulo: 'Entidad beneficiaria inválida.',
       detalle: 'beneficiario.codigoEntidad debe ser exactamente 8 dígitos del catálogo BanRep.',
@@ -146,7 +156,15 @@ app.post('/breb/v1/pagos', (req, res) => {
     if (!LLAVE_VALIDATORS[tipoLlave].test(llave)) {
       const r = buildRejectedResponse(idTransaccion, 'BREB002',
         `La llave '${llave}' no cumple el formato esperado para tipoLlave '${tipoLlave}'. ` +
-        `Formatos aceptados — TELEFONO: +57XXXXXXXXXX | NIT: XXXXXXXXX-D | EMAIL: user@domain.co | ALIAS: 4–20 alfanuméricos.`);
+        `Formatos aceptados — CC: 6–10 dígitos | CE: 6–7 dígitos | NIT: XXXXXXXXX-D | ` +
+        `PASAPORTE: 6–12 alfanuméricos | TELEFONO: +573XXXXXXXXX (móvil) | EMAIL: user@domain.co | ALIAS: @alfanum.`);
+      processedPayments.set(idTransaccion, r);
+      return res.status(200).json(r);
+    }
+    // P04 — NIT mod-11 DIAN check digit validation (not just regex form)
+    if (tipoLlave === 'NIT' && !isValidNIT(llave)) {
+      const r = buildRejectedResponse(idTransaccion, 'BREB002',
+        `NIT '${llave}' falló validación de dígito verificador (DIAN mod-11).`);
       processedPayments.set(idTransaccion, r);
       return res.status(200).json(r);
     }

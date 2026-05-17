@@ -21,5 +21,6 @@ export const brebPaymentLatency = new client.Histogram({
 export const brebRetryCount = new client.Counter({
   name: 'mipit_adapter_breb_retries_total',
   help: 'Total retry attempts for Bre-B payments',
+  labelNames: ['outcome'], // P04: transient_retry | permanent_error | exhausted
   registers: [registry],
 });

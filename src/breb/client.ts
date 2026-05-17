@@ -1,8 +1,8 @@
 import { env } from '../config/env.js';
 import { logger } from '../observability/logger.js';
 import type { BreBPaymentRequest, BreBPaymentResponse } from './types.js';
+import { withRetry, BreBPermanentError } from './retry.js';
 
-const MAX_RETRIES = env.BREB_MAX_RETRIES;
 const TIMEOUT_MS = env.BREB_TIMEOUT_MS;
 
 let cachedToken: { token: string; expiresAt: number } | null = null;
@@ -38,14 +38,15 @@ async function getOAuthToken(): Promise<string> {
 }
 
 /**
- * Sends a Bre-B payment request to the BanRep SPI endpoint (or mock).
- * Retries up to BREB_MAX_RETRIES times on transient failures (5xx, network errors).
+ * P04 — Sends a Bre-B payment request via the shared `withRetry` helper.
+ * Previously this file inlined its own backoff loop (linear `200 * attempt`)
+ * while PIX/SPEI used exponential `500 * 2^(n-1)`. Now uniform.
+ * Also wires `brebRetryCount` metric (was declared but never incremented).
  */
 export async function sendBrebPayment(request: BreBPaymentRequest): Promise<BreBPaymentResponse> {
   const url = `${env.BREB_SANDBOX_URL}/breb/v1/pagos`;
-  let lastError: Error | null = null;
 
-  for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+  return withRetry(async (attempt) => {
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), TIMEOUT_MS);
 
@@ -82,17 +83,16 @@ export async function sendBrebPayment(request: BreBPaymentRequest): Promise<BreB
         });
       }
 
-      clearTimeout(timeoutId);
-
       const body = await res.json() as BreBPaymentResponse;
 
       if (!res.ok && res.status < 500) {
-        // 4xx: client error — do not retry
+        // 4xx: client error — surface as permanent (no retry).
         logger.warn({ status: res.status, body }, 'Bre-B SPI returned client error');
-        return body;
+        throw new BreBPermanentError(`Bre-B SPI 4xx: ${res.status}`, res.status, body);
       }
 
       if (!res.ok) {
+        // 5xx: transient — will be retried by withRetry.
         throw new Error(`Bre-B SPI server error: HTTP ${res.status}`);
       }
 
@@ -102,22 +102,18 @@ export async function sendBrebPayment(request: BreBPaymentRequest): Promise<BreB
       );
       return body;
     } catch (err) {
-      clearTimeout(timeoutId);
-      lastError = err instanceof Error ? err : new Error(String(err));
-      logger.warn(
-        { attempt, maxRetries: MAX_RETRIES, err: lastError.message },
-        'Bre-B payment attempt failed, retrying...',
-      );
-
-      if (attempt < MAX_RETRIES) {
-        await sleep(200 * attempt); // exponential backoff: 200ms, 400ms, ...
+      // Surface PermanentError up so withRetry doesn't retry 4xx.
+      if (err instanceof BreBPermanentError) {
+        // Return the body if available — adapter caller wants to map it.
+        if (err.body) return err.body as BreBPaymentResponse;
+        throw err;
       }
+      logger.warn({ err: String(err) }, 'Bre-B payment attempt failed');
+      throw err;
+    } finally {
+      clearTimeout(timeoutId);
     }
-  }
-
-  throw lastError ?? new Error('Bre-B payment failed after all retries');
+  });
 }
 
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
+// P04: sleep() helper removed — retry timing now centralized in retry.ts.

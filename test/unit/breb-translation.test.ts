@@ -3,7 +3,10 @@
  * These tests verify the end-to-end translation pipeline used by the adapter.
  */
 
-import { brebToCanonical, generateBrebTransactionId, type BreBPaymentRequest } from '../../src/breb/types';
+// P04: removed broken import `brebToCanonical` (was never exported from types).
+// The canonical translator lives in mipit-core; this file tests only the
+// adapter-side helpers exported from types.ts.
+import { generateBrebTransactionId, type BreBPaymentRequest } from '../../src/breb/types';
 
 // Re-test translation functions from adapter perspective
 describe('generateBrebTransactionId', () => {
@@ -35,7 +38,8 @@ describe('generateBrebTransactionId', () => {
 describe('BreBPaymentRequest shape', () => {
   it('has required fields', () => {
     const req: BreBPaymentRequest = {
-      idTransaccion: generateBrebTransactionId(),
+      // P04: use legacy 8-digit entity code to keep 32-char length expectation
+      idTransaccion: generateBrebTransactionId('26264220'),
       valor: { original: '500000.00' },
       pagador: {
         codigoEntidad: '26264220',

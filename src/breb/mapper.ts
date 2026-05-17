@@ -57,11 +57,21 @@ export function canonicalToBreBPayload(canonical: CanonicalPacs008): BreBPayment
     : creditorAccount;
   const llave = rawLlave.replace(/^BREB-/, '');
 
-  // Derive key type from alias format
-  let tipoLlave: 'TELEFONO' | 'NIT' | 'EMAIL' | 'ALIAS' = 'ALIAS';
-  if (/^\+57\d{10}$/.test(llave)) tipoLlave = 'TELEFONO';
+  // P04 — Full BanRep llave taxonomy. Inference is best-effort; explicit
+  // `tipoLlave` from canonical takes precedence if provided. ALIAS is the
+  // catch-all default for unrecognized formats (preserves backward compat
+  // with consumers that pass arbitrary user-defined aliases).
+  let tipoLlave: 'CC' | 'CE' | 'NIT' | 'PASAPORTE' | 'TELEFONO' | 'EMAIL' | 'ALIAS' = 'ALIAS';
+  if (/^\+573\d{9}$/.test(llave)) tipoLlave = 'TELEFONO'; // mobile only (+57 3xx)
   else if (/^\d{9,10}-\d$/.test(llave)) tipoLlave = 'NIT';
-  else if (llave.includes('@')) tipoLlave = 'EMAIL';
+  else if (/^@[a-zA-Z0-9._]{3,19}$/.test(llave)) tipoLlave = 'ALIAS'; // explicit @-prefix
+  else if (/^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$/.test(llave)) tipoLlave = 'EMAIL';
+  // PASAPORTE: very specific — uppercase letters followed by digits (Colombian
+  // passport convention, e.g. "AB123456"). Won't match lowercase strings.
+  else if (/^[A-Z]{1,3}\d{5,10}$/.test(llave)) tipoLlave = 'PASAPORTE';
+  else if (/^\d{6,7}$/.test(llave)) tipoLlave = 'CE'; // shorter — CE
+  else if (/^\d{8,10}$/.test(llave)) tipoLlave = 'CC'; // 8-10 digits — CC (CE handled above)
+  // else keep ALIAS as the safe default for unrecognized formats
 
   const idTransaccion = generateBrebTransactionId(pagadorEntidad);
 
