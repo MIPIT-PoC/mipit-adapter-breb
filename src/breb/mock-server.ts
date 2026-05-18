@@ -119,7 +119,8 @@ app.post('/breb/v1/pagos', (req, res) => {
   if (!pagador?.codigoEntidad || !/^(\d{4}|\d{8})$/.test(pagador.codigoEntidad)) {
     return res.status(400).json({
       titulo: 'Entidad pagadora inválida.',
-      detalle: 'pagador.codigoEntidad debe ser exactamente 8 dígitos del catálogo BanRep.',
+      // W6.7 — accept 4-digit Superfinanciera (preferred per TR-002) or legacy 8-digit.
+      detalle: 'pagador.codigoEntidad debe ser 4 dígitos (catálogo Superfinanciera) u 8 dígitos (formato legacy).',
       violaciones: [{ razon: 'Formato inválido.', campo: 'pagador.codigoEntidad' }],
     });
   }
@@ -137,7 +138,7 @@ app.post('/breb/v1/pagos', (req, res) => {
   if (beneficiario?.codigoEntidad && !/^(\d{4}|\d{8})$/.test(beneficiario.codigoEntidad)) {
     return res.status(400).json({
       titulo: 'Entidad beneficiaria inválida.',
-      detalle: 'beneficiario.codigoEntidad debe ser exactamente 8 dígitos del catálogo BanRep.',
+      detalle: 'beneficiario.codigoEntidad debe ser 4 dígitos (catálogo Superfinanciera) u 8 dígitos (formato legacy).',
       violaciones: [{ razon: 'Formato inválido.', campo: 'beneficiario.codigoEntidad' }],
     });
   }
