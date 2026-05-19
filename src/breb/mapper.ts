@@ -38,11 +38,15 @@ export function canonicalToBreBPayload(canonical: CanonicalPacs008): BreBPayment
   const localAmount =
     (canonical.fx as { local_amount?: number } | undefined)?.local_amount
     ?? canonical.amount.value * (canonical.fx?.rate ?? 1);
-  // BanRep: COP integer, no decimals. Keep one decimal pair for backward
-  // compat with old test fixtures expecting "500000.00" format.
+  // Audit 3 X8 / B1-006 — W5.10 declaró "COP integer no decimals", pero
+  // este mapper re-añadía ".00" antes del wire, anulando el integer que
+  // el core (`canonical-to-breb.ts`) emite. Resultado: la evidence "live"
+  // medía DB (integer) pero el mock recibía "83267.00". Corrigiendo:
+  // COP integer puro per BanRep TR-002 §5; sólo monedas non-COP llevan
+  // decimales (caso patológico — Bre-B es COP-domestic).
   const ccy = canonical.amount.currency?.toUpperCase() ?? 'COP';
   const amountStr = ccy === 'COP'
-    ? Math.round(localAmount).toString() + '.00' // legacy compat: keep .00 suffix
+    ? Math.round(localAmount).toString()
     : (Math.round(localAmount * 100) / 100).toFixed(2);
 
   const pagadorEntidad = canonical.origin.ispb ?? BREB_ENTITY_CODES.FINTECH_SIMULATED;

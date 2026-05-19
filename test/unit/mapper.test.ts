@@ -36,16 +36,18 @@ describe('canonicalToBreBPayload', () => {
     expect(result.idTransaccion).toHaveLength(32);
   });
 
-  it('maps amount correctly (no FX rate)', () => {
+  // Audit 3 X8 / B1-006 — COP es integer puro per BanRep TR-002 §5.
+  // El mapper anterior agregaba ".00" anulando el integer del core.
+  it('maps amount correctly (no FX rate) — COP integer per BanRep TR-002 §5', () => {
     const result = canonicalToBreBPayload(makeCanonical());
-    expect(result.valor.original).toBe('500000.00');
+    expect(result.valor.original).toBe('500000');
   });
 
-  it('applies FX rate when provided', () => {
+  it('applies FX rate when provided — result remains COP integer', () => {
     const canonical = makeCanonical({ fx: { source_currency: 'USD', rate: 4100 } });
     const result = canonicalToBreBPayload(canonical);
-    // 500000 USD * 4100 = 2,050,000,000 COP
-    expect(result.valor.original).toBe('2050000000.00');
+    // 500000 USD * 4100 = 2,050,000,000 COP (no decimals)
+    expect(result.valor.original).toBe('2050000000');
   });
 
   it('maps pagador entity from origin.ispb', () => {
