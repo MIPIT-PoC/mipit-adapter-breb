@@ -12,16 +12,22 @@ export interface RailAck {
  *
  * BanRep SPI statuses:
  *   ACEPTADA    → ACCEPTED
- *   RECHAZADA   → REJECTED (with BanRep error code)
+ *   RECHAZADA   → REJECTED (with MIPIT-invented error code, see below)
  *   DEVUELTA    → REJECTED (returned/refunded)
  *   EN_PROCESO  → ERROR (timeout / still processing)
  *
- * Error codes (BanRep spec):
- *   BREB001 — Fondos insuficientes
- *   BREB002 — Cuenta/entidad no encontrada
- *   BREB003 — Límite de transacción excedido
- *   BREB004 — Receptor no registrado en Bre-B
- *   BREB005 — Timeout del sistema BanRep
+ * Error codes (MIPIT-invented — Audit 3 X10 / W5.13 fix completion):
+ *   BREB001-005 son códigos de demo del PoC, NO publicados por BanRep
+ *   (BanRep TR-002 v1.0.0 GA 2025-10-06 no enumera códigos de rechazo
+ *   externos en la sección §6 de error-handling — quedan a discreción
+ *   de cada EOP autorizada). Estos códigos se mapean a ISO 20022
+ *   ExternalStatusReason1Code en rail-rejection-mapping.ts (Wave 6 W6.2).
+ *
+ *   BREB001 — Fondos insuficientes      → ISO AM04
+ *   BREB002 — Cuenta/entidad no encontrada → ISO AC01
+ *   BREB003 — Límite de transacción excedido → ISO AM02
+ *   BREB004 — Receptor no registrado en Bre-B → ISO AC04
+ *   BREB005 — Timeout del sistema BanRep → ISO MS03
  */
 export function brebResponseToAck(response: BreBPaymentResponse): RailAck {
   const railTxId = response.idConfirmacion ?? response.idTransaccion;

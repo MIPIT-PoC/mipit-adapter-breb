@@ -33,9 +33,21 @@ interface CanonicalPacs008 {
  * If fx.rate is present, apply it. Otherwise assume amount is already COP.
  */
 export function canonicalToBreBPayload(canonical: CanonicalPacs008): BreBPaymentRequest {
-  const fxRate = canonical.fx?.rate ?? 1;
-  const localAmount = canonical.amount.value * fxRate;
-  const amountStr = (Math.round(localAmount * 100) / 100).toFixed(2);
+  // P05 — Prefer canonical.fx.local_amount (set by normalizer post-FX). COP
+  // has no centavos per BanRep: emit as integer (formatAmount(x, 'COP')).
+  const localAmount =
+    (canonical.fx as { local_amount?: number } | undefined)?.local_amount
+    ?? canonical.amount.value * (canonical.fx?.rate ?? 1);
+  // Audit 3 X8 / B1-006 — W5.10 declaró "COP integer no decimals", pero
+  // este mapper re-añadía ".00" antes del wire, anulando el integer que
+  // el core (`canonical-to-breb.ts`) emite. Resultado: la evidence "live"
+  // medía DB (integer) pero el mock recibía "83267.00". Corrigiendo:
+  // COP integer puro per BanRep TR-002 §5; sólo monedas non-COP llevan
+  // decimales (caso patológico — Bre-B es COP-domestic).
+  const ccy = canonical.amount.currency?.toUpperCase() ?? 'COP';
+  const amountStr = ccy === 'COP'
+    ? Math.round(localAmount).toString()
+    : (Math.round(localAmount * 100) / 100).toFixed(2);
 
   const pagadorEntidad = canonical.origin.ispb ?? BREB_ENTITY_CODES.FINTECH_SIMULATED;
   const beneficiarioEntidad = canonical.destination.ispb ?? BREB_ENTITY_CODES.FINTECH_SIMULATED;
@@ -57,11 +69,21 @@ export function canonicalToBreBPayload(canonical: CanonicalPacs008): BreBPayment
     : creditorAccount;
   const llave = rawLlave.replace(/^BREB-/, '');
 
-  // Derive key type from alias format
-  let tipoLlave: 'TELEFONO' | 'NIT' | 'EMAIL' | 'ALIAS' = 'ALIAS';
-  if (/^\+57\d{10}$/.test(llave)) tipoLlave = 'TELEFONO';
+  // P04 — Full BanRep llave taxonomy. Inference is best-effort; explicit
+  // `tipoLlave` from canonical takes precedence if provided. ALIAS is the
+  // catch-all default for unrecognized formats (preserves backward compat
+  // with consumers that pass arbitrary user-defined aliases).
+  let tipoLlave: 'CC' | 'CE' | 'NIT' | 'PASAPORTE' | 'TELEFONO' | 'EMAIL' | 'ALIAS' = 'ALIAS';
+  if (/^\+573\d{9}$/.test(llave)) tipoLlave = 'TELEFONO'; // mobile only (+57 3xx)
   else if (/^\d{9,10}-\d$/.test(llave)) tipoLlave = 'NIT';
-  else if (llave.includes('@')) tipoLlave = 'EMAIL';
+  else if (/^@[a-zA-Z0-9._]{3,19}$/.test(llave)) tipoLlave = 'ALIAS'; // explicit @-prefix
+  else if (/^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$/.test(llave)) tipoLlave = 'EMAIL';
+  // PASAPORTE: very specific — uppercase letters followed by digits (Colombian
+  // passport convention, e.g. "AB123456"). Won't match lowercase strings.
+  else if (/^[A-Z]{1,3}\d{5,10}$/.test(llave)) tipoLlave = 'PASAPORTE';
+  else if (/^\d{6,7}$/.test(llave)) tipoLlave = 'CE'; // shorter — CE
+  else if (/^\d{8,10}$/.test(llave)) tipoLlave = 'CC'; // 8-10 digits — CC (CE handled above)
+  // else keep ALIAS as the safe default for unrecognized formats
 
   const idTransaccion = generateBrebTransactionId(pagadorEntidad);
 

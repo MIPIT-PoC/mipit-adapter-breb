@@ -1,4 +1,5 @@
 import type { Channel, ConsumeMessage } from 'amqplib';
+import { randomUUID } from 'node:crypto';
 import { env } from './config/env.js';
 import { ADAPTER_ID, RAIL } from './config/constants.js';
 import { canonicalToBreBPayload } from './breb/mapper.js';
@@ -6,15 +7,20 @@ import { brebResponseToAck } from './breb/response-mapper.js';
 import { sendBrebPayment } from './breb/client.js';
 import { publishAck } from './messaging/publisher.js';
 import { logger } from './observability/logger.js';
-import { brebPaymentsTotal, brebPaymentLatency } from './observability/metrics.js';
+import { brebPaymentsTotal, brebPaymentLatency, recordAdapterRequest } from './observability/metrics.js';
 
 export interface PaymentRouteMessage {
   payment_id: string;
   trace_id: string;
-  canonical: Record<string, unknown>;
+  canonical: Record<string, unknown> & {
+    pmtId?: { endToEndId?: string; uetr?: string };
+    grpHdr?: { msgId?: string };
+  };
   destination_rail: string;
   route_rule_applied: string;
   routed_at: string;
+  /** W6.1 — original pacs.008 UETR for correlation in the pacs.002 ack. */
+  uetr?: string;
 }
 
 export interface PaymentAckMessage {
@@ -30,8 +36,24 @@ export interface PaymentAckMessage {
     error?: { code: string; message: string };
     raw_response?: Record<string, unknown>;
   };
+  /** W6.1 — ISO 20022 pacs.002 block for cross-border correlation. */
+  pacs002?: {
+    msgId: string;
+    orgnlMsgId?: string;
+    orgnlMsgNmId: string;
+    orgnlEndToEndId: string;
+    orgnlUetr?: string;
+    txSts: 'ACSC' | 'ACSP' | 'RJCT' | 'PDNG' | 'PART';
+    stsRsnInf?: { rsn: { cd?: string; prtry?: string }; addtlInf?: string[] };
+  };
   latency_ms: number;
   processed_at: string;
+}
+
+function railStatusToTxSts(status: 'ACCEPTED' | 'REJECTED' | 'ERROR'): 'ACSC' | 'RJCT' | 'PDNG' {
+  if (status === 'ACCEPTED') return 'ACSC';
+  if (status === 'REJECTED') return 'RJCT';
+  return 'PDNG';
 }
 
 export async function startWorker(channel: Channel) {
@@ -65,6 +87,7 @@ export async function startWorker(channel: Channel) {
       const railAck = brebResponseToAck(brebResponse);
       const latencyMs = Date.now() - startTime;
 
+      const txSts = railStatusToTxSts(railAck.status);
       const ackMessage: PaymentAckMessage = {
         payment_id: routeMsg.payment_id,
         trace_id: routeMsg.trace_id,
@@ -73,14 +96,28 @@ export async function startWorker(channel: Channel) {
         instance_id: env.INSTANCE_ID,
         status: railAck.status === 'ACCEPTED' ? 'ACKED_BY_RAIL' : 'REJECTED',
         rail_ack: railAck,
+        pacs002: {
+          msgId: `STS-${randomUUID()}`,
+          orgnlMsgId: routeMsg.canonical.grpHdr?.msgId,
+          orgnlMsgNmId: 'pacs.008.001.10',
+          orgnlEndToEndId: routeMsg.canonical.pmtId?.endToEndId ?? routeMsg.payment_id,
+          orgnlUetr: routeMsg.uetr ?? routeMsg.canonical.pmtId?.uetr,
+          txSts,
+          stsRsnInf: railAck.error
+            ? { rsn: { prtry: railAck.error.code }, addtlInf: [railAck.error.message] }
+            : undefined,
+        },
         latency_ms: latencyMs,
         processed_at: new Date().toISOString(),
       };
 
       publishAck(channel, ackMessage );
 
-      brebPaymentsTotal.inc({ status: railAck.status === 'ACCEPTED' ? 'success' : 'rejected' });
-      brebPaymentLatency.observe({ status: railAck.status === 'ACCEPTED' ? 'success' : 'rejected' }, latencyMs);
+      // P07: unified `mipit_adapter_*` metrics + legacy
+      const outcome = railAck.status === 'ACCEPTED' ? 'success' : 'rejected';
+      brebPaymentsTotal.inc({ status: outcome });
+      brebPaymentLatency.observe({ status: outcome }, latencyMs);
+      recordAdapterRequest(outcome, latencyMs, railAck.error?.code);
 
       logger.info(
         { payment_id: routeMsg.payment_id, status: railAck.status, latency_ms: latencyMs },
@@ -103,6 +140,15 @@ export async function startWorker(channel: Channel) {
           status: 'ERROR',
           error: { code: 'ADAPTER_ERROR', message: String(err) },
         },
+        pacs002: {
+          msgId: `STS-${randomUUID()}`,
+          orgnlMsgId: routeMsg.canonical.grpHdr?.msgId,
+          orgnlMsgNmId: 'pacs.008.001.10',
+          orgnlEndToEndId: routeMsg.canonical.pmtId?.endToEndId ?? routeMsg.payment_id,
+          orgnlUetr: routeMsg.uetr ?? routeMsg.canonical.pmtId?.uetr,
+          txSts: 'PDNG',
+          stsRsnInf: { rsn: { prtry: 'ADAPTER_ERROR' }, addtlInf: [String(err).slice(0, 105)] },
+        },
         latency_ms: latencyMs,
         processed_at: new Date().toISOString(),
       };
@@ -111,6 +157,7 @@ export async function startWorker(channel: Channel) {
 
       brebPaymentsTotal.inc({ status: 'error' });
       brebPaymentLatency.observe({ status: 'error' }, latencyMs);
+      recordAdapterRequest('error', latencyMs, 'WORKER_ERROR');
 
       channel.nack(msg, false, false);
     }

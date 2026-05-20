@@ -36,16 +36,18 @@ describe('canonicalToBreBPayload', () => {
     expect(result.idTransaccion).toHaveLength(32);
   });
 
-  it('maps amount correctly (no FX rate)', () => {
+  // Audit 3 X8 / B1-006 — COP es integer puro per BanRep TR-002 §5.
+  // El mapper anterior agregaba ".00" anulando el integer del core.
+  it('maps amount correctly (no FX rate) — COP integer per BanRep TR-002 §5', () => {
     const result = canonicalToBreBPayload(makeCanonical());
-    expect(result.valor.original).toBe('500000.00');
+    expect(result.valor.original).toBe('500000');
   });
 
-  it('applies FX rate when provided', () => {
+  it('applies FX rate when provided — result remains COP integer', () => {
     const canonical = makeCanonical({ fx: { source_currency: 'USD', rate: 4100 } });
     const result = canonicalToBreBPayload(canonical);
-    // 500000 USD * 4100 = 2,050,000,000 COP
-    expect(result.valor.original).toBe('2050000000.00');
+    // 500000 USD * 4100 = 2,050,000,000 COP (no decimals)
+    expect(result.valor.original).toBe('2050000000');
   });
 
   it('maps pagador entity from origin.ispb', () => {
@@ -146,8 +148,13 @@ describe('canonicalToBreBPayload', () => {
 });
 
 describe('generateBrebTransactionId', () => {
-  it('generates exactly 32 chars', () => {
-    const id = generateBrebTransactionId();
+  it('generates exactly 28 chars with 4-digit entity (P04 preferred)', () => {
+    const id = generateBrebTransactionId('9999');
+    expect(id).toHaveLength(28);
+  });
+
+  it('generates exactly 32 chars with legacy 8-digit entity (backward compat)', () => {
+    const id = generateBrebTransactionId('00009999');
     expect(id).toHaveLength(32);
   });
 
@@ -156,14 +163,16 @@ describe('generateBrebTransactionId', () => {
     expect(id.startsWith('BR')).toBe(true);
   });
 
-  it('contains codigoEntidad at positions 2-9', () => {
+  it('contains codigoEntidad at positions 2-9 with legacy 8-digit', () => {
     const id = generateBrebTransactionId('26264220');
     expect(id.substring(2, 10)).toBe('26264220');
   });
 
-  it('matches the BR{8}{8}{4}{10} pattern', () => {
-    const id = generateBrebTransactionId();
-    expect(id).toMatch(/^BR\d{8}\d{8}\d{4}[A-Z0-9]{10}$/);
+  it('matches BR{4-or-8}{8 date}{4 time}{10 alnum} pattern', () => {
+    const id4 = generateBrebTransactionId('9999');
+    expect(id4).toMatch(/^BR\d{4}\d{8}\d{4}[A-Z0-9]{10}$/);
+    const id8 = generateBrebTransactionId('00009999');
+    expect(id8).toMatch(/^BR\d{8}\d{8}\d{4}[A-Z0-9]{10}$/);
   });
 
   it('generates unique IDs on each call', () => {
