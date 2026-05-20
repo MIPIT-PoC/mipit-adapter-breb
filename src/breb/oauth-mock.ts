@@ -77,7 +77,14 @@ export function registerOAuth2Routes(app: Express): void {
 }
 
 export function oauthMiddleware(req: Request, res: Response, next: NextFunction): void {
-  if (req.path === '/health' || req.path.startsWith('/oauth') || req.path.startsWith('/admin')) {
+  // Audit 4 — /api/simulate/* es endpoint demo del frontend mipit-mock-berb-ui;
+  // requerir OAuth ahí rompería la doble-vía UI sin token (Carlos lo dejó público).
+  if (
+    req.path === '/health' ||
+    req.path.startsWith('/oauth') ||
+    req.path.startsWith('/admin') ||
+    req.path.startsWith('/api/simulate')
+  ) {
     return next();
   }
 
