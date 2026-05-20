@@ -37,7 +37,8 @@ const app = express();
 app.use((_req, res, next) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, PATCH, DELETE, OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Requested-With, Accept');
+  res.setHeader('Access-Control-Max-Age', '3600');
   if (_req.method === 'OPTIONS') return res.sendStatus(204);
   next();
 });
@@ -307,6 +308,54 @@ function buildRejectedResponse(
     descripcionError: descripcion,
   };
 }
+
+/** Frontend API Simulator endpoint */
+app.post('/api/simulate/breb', (req, res) => {
+  try {
+    const { debtorAlias, creditorAlias, amount, currency, purpose, reference } = req.body;
+
+    // Validation
+    if (!debtorAlias || !creditorAlias || !amount || !currency) {
+      return res.status(400).json({
+        error: 'Missing required fields',
+        required: ['debtorAlias', 'creditorAlias', 'amount', 'currency'],
+      });
+    }
+
+    // Simulate occasional failures (10%)
+    const shouldFail = Math.random() < 0.1;
+    const paymentId = `BRE${Date.now()}${Math.random().toString(36).substring(7)}`;
+    const timestamp = new Date().toISOString();
+
+    const responsePayload = {
+      payment_id: paymentId,
+      status: shouldFail ? 'failed' : 'completed',
+      rail: 'BRE_B',
+      timestamp,
+      details: {
+        debtor: debtorAlias,
+        creditor: creditorAlias,
+        amount: Number(amount),
+        currency,
+        purpose: purpose ?? 'TRANSFERENCIA',
+        reference: reference ?? 'AUTO',
+        processor_latency_ms: Math.round(150 + Math.random() * 450),
+        error: shouldFail ? {
+          code: 'IC-001',
+          message: 'Fondos insuficientes en la cuenta de origen',
+        } : null,
+      },
+    };
+
+    res.status(200).json(responsePayload);
+  } catch (err) {
+    logger.error(err, 'Error in /api/simulate/breb');
+    res.status(500).json({
+      error: 'Internal server error',
+      message: err instanceof Error ? err.message : 'Unknown error',
+    });
+  }
+});
 
 export function startMockServer(): Promise<void> {
   return new Promise((resolve) => {
