@@ -100,10 +100,13 @@ app.post('/breb/v1/pagos', (req, res) => {
   }
 
   // === Validation: Amount format ===
-  if (!valor?.original || !/^\d+\.\d{2}$/.test(valor.original)) {
+  // Audit 4 B1-007 — BanRep TR-002 §5 declara COP integer (sin decimales), pero
+  // el mock original requería ".XX" forzando inconsistencia con `mapper.ts`
+  // que ya emite COP integer. Aceptamos ambos: "500000" e "500000.00".
+  if (!valor?.original || !/^\d+(\.\d{2})?$/.test(valor.original)) {
     return res.status(400).json({
       titulo: 'Parámetro inválido.',
-      detalle: 'valor.original debe ser string con exactamente 2 decimales (ej: "500000.00" COP).',
+      detalle: 'valor.original debe ser string numérico — COP integer (ej: "500000") o con 2 decimales para monedas non-COP (ej: "500000.00").',
       violaciones: [{ razon: 'Formato inválido.', campo: 'valor.original' }],
     });
   }
